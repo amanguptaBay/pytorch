@@ -13,6 +13,7 @@ import torch._inductor.fx_passes.group_batch_fusion
 from torch._dynamo.utils import counters
 from torch._inductor import config
 from torch._inductor.fx_passes.group_batch_fusion import (
+    _has_layout_sensitive_user,
     apply_group_batch_fusion,
     BatchSubPostGradFusion,
 )
@@ -90,6 +91,315 @@ def _check_lhs_fusion(
         test_case.assertEqual(
             [t.stride() for t in actual], [t.stride() for t in expected]
         )
+
+
+def _guard_sin(graph, node):
+    result = graph.call_function(torch.sin, args=(node,))
+    result.meta["example_value"] = torch.sin(node.meta["example_value"])
+    return result
+
+
+def _guard_contiguous(graph, node):
+    result = graph.call_method("contiguous", args=(node,))
+    result.meta["example_value"] = node.meta["example_value"]
+    return result
+
+
+def _guard_transpose(graph, node):
+    result = graph.call_method("transpose", args=(node, 0, 1))
+    result.meta["example_value"] = node.meta["example_value"].transpose(0, 1)
+    return result
+
+
+def _guard_split_view(graph, node):
+    result = graph.call_method("view", args=(node, 2, 2, 6))
+    result.meta["example_value"] = node.meta["example_value"].view(2, 2, 6)
+    return result
+
+
+def _guard_conversion(graph, node, copy_result, transpose_source=True):
+    source = _guard_transpose(graph, node) if transpose_source else node
+    if copy_result:
+        result = graph.call_method("to", args=(source, torch.float64))
+        result.meta["example_value"] = source.meta["example_value"].to(torch.float64)
+    else:
+        result = graph.call_method("float", args=(source,))
+        result.meta["example_value"] = source.meta["example_value"]
+    return result
+
+
+def _guard_placeholder(graph, name):
+    result = graph.placeholder(name)
+    result.meta["example_value"] = torch.empty(4, 6)
+    return result
+
+
+def _guard_with_contiguous_sibling(graph, node):
+    _guard_sin(graph, _guard_contiguous(graph, node))
+
+
+def _guard_case_output(graph, node):
+    graph.output(node)
+
+
+def _guard_case_merge_view(graph, node):
+    result = graph.call_method("view", args=(node, -1))
+    result.meta["example_value"] = node.meta["example_value"].view(-1)
+
+
+def _guard_case_merge_view_2d(graph, node):
+    result = graph.call_method("view", args=(node, 2, 12))
+    result.meta["example_value"] = node.meta["example_value"].view(2, 12)
+
+
+def _guard_case_transpose_output(graph, node):
+    graph.output(_guard_transpose(graph, node))
+
+
+def _guard_case_no_metadata_alias(graph, node):
+    graph.output(graph.call_method("float", args=(node,)))
+
+
+def _guard_case_mutable(graph, node):
+    graph.call_function(torch.ops.aten.add_.Tensor, args=(node, 1))
+
+
+def _guard_case_split_view_mutation(graph, node):
+    graph.call_method("mul_", args=(_guard_split_view(graph, node), 2))
+
+
+def _guard_case_view_setitem(graph, node):
+    view = _guard_split_view(graph, node)
+    graph.call_function(operator.setitem, args=(view, 0, 0))
+
+
+def _guard_case_contiguous_mutation(graph, node):
+    graph.call_method("mul_", args=(_guard_contiguous(graph, node), 2))
+
+
+def _guard_case_inplace_relu(graph, node):
+    graph.call_function(
+        torch.nn.functional.relu, args=(node,), kwargs={"inplace": True}
+    )
+
+
+def _guard_case_elu_inplace_pos(graph, node):
+    graph.call_function(torch.nn.functional.elu, args=(node, 1.0, True))
+
+
+def _guard_case_out_user(graph, node):
+    graph.call_function(
+        torch.ops.aten.sin.out,
+        args=(node,),
+        kwargs={"out": _guard_placeholder(graph, "out")},
+    )
+
+
+def _guard_case_clone_out(graph, node):
+    _guard_with_contiguous_sibling(graph, node)
+    graph.call_function(
+        torch.ops.aten.clone.out,
+        args=(node,),
+        kwargs={"out": _guard_placeholder(graph, "out")},
+    )
+
+
+def _guard_case_to_copy_out(graph, node):
+    _guard_with_contiguous_sibling(graph, node)
+    graph.call_function(
+        torch.ops.aten._to_copy.out,
+        args=(node,),
+        kwargs={"out": _guard_placeholder(graph, "out")},
+    )
+
+
+def _guard_case_normalize_out(graph, node):
+    _guard_with_contiguous_sibling(graph, node)
+    other = _guard_placeholder(graph, "other")
+    result = graph.call_function(
+        torch.nn.functional.normalize, args=(other,), kwargs={"out": node}
+    )
+    result.meta["example_value"] = other.meta["example_value"]
+
+
+def _guard_case_contiguous(graph, node):
+    _guard_contiguous(graph, node)
+
+
+def _guard_case_conversion(graph, node):
+    graph.call_method("mul_", args=(_guard_conversion(graph, node, False, False), 2))
+
+
+def _guard_case_conversion_dtype_after_transpose(graph, node):
+    _guard_conversion(graph, node, True, True)
+
+
+def _guard_case_conversion_noop_after_transpose(graph, node):
+    graph.call_method("mul_", args=(_guard_conversion(graph, node, False, True), 2))
+
+
+def _guard_case_view_then_memory_format(graph, node):
+    view = _guard_split_view(graph, node)
+    result = graph.call_method(
+        "to", args=(view,), kwargs={"memory_format": torch.contiguous_format}
+    )
+    result.meta["example_value"] = view.meta["example_value"]
+
+
+def _guard_case_elu_inplace_false(graph, node):
+    graph.call_function(torch.nn.functional.elu, args=(node, 1.0, False))
+
+
+def _guard_case_clone(graph, node):
+    result = graph.call_method("clone", args=(node,))
+    result.meta["example_value"] = node.meta["example_value"].clone()
+
+
+def _guard_case_split_view(graph, node):
+    _guard_sin(graph, _guard_split_view(graph, node))
+
+
+def _guard_case_view_with_one(graph, node):
+    result = graph.call_method("view", args=(node, 4, 1, 6))
+    result.meta["example_value"] = node.meta["example_value"].view(4, 1, 6)
+    _guard_sin(graph, result)
+
+
+def _guard_case_stride(graph, node):
+    graph.call_function(torch.ops.aten.sym_stride.int, args=(node, 0))
+
+
+def _guard_case_transpose(graph, node):
+    _guard_sin(graph, _guard_transpose(graph, node))
+
+
+def _guard_case_getitem(graph, node):
+    item = graph.call_function(operator.getitem, args=(node, 0))
+    item.meta["example_value"] = node.meta["example_value"][0]
+    _guard_sin(graph, item)
+
+
+def _guard_case_split_call_function(graph, node):
+    parts = graph.call_function(torch.split, args=(node, [3, 3], 1))
+    parts.meta["example_value"] = torch.split(node.meta["example_value"], [3, 3], 1)
+    item = graph.call_function(operator.getitem, args=(parts, 0))
+    item.meta["example_value"] = parts.meta["example_value"][0]
+    _guard_sin(graph, item)
+
+
+def _guard_case_reshape_kwargs(graph, node):
+    result = graph.call_function(
+        torch.reshape, kwargs={"input": node, "shape": (2, 2, 6)}
+    )
+    result.meta["example_value"] = node.meta["example_value"].reshape(2, 2, 6)
+    _guard_sin(graph, result)
+
+
+def _guard_case_log_softmax_stacklevel(graph, node):
+    result = graph.call_function(
+        torch.nn.functional.log_softmax, args=(node, 1, 3)
+    )
+    result.meta["example_value"] = torch.nn.functional.log_softmax(
+        node.meta["example_value"], 1
+    )
+
+
+def _guard_case_custom(graph, node):
+    graph.call_function(
+        torch.ops._batch_linear_lhs_test.require_contiguous.default, args=(node,)
+    )
+
+
+def _guard_case_higher_order(graph, node):
+    from torch._higher_order_ops.triton_kernel_wrap import (
+        triton_kernel_wrapper_mutation,
+    )
+
+    graph.call_function(
+        triton_kernel_wrapper_mutation, kwargs={"kwargs": {"input": node}}
+    )
+
+
+def _guard_case_call_module(graph, node):
+    graph.call_module("m", args=(node,))
+
+
+def _guard_case_dropout_eval_output(graph, node):
+    result = graph.call_function(
+        torch.nn.functional.dropout, args=(node, 0.1, False)
+    )
+    result.meta["example_value"] = node.meta["example_value"]
+    graph.output(result)
+
+
+def _guard_case_dropout_training(graph, node):
+    result = graph.call_function(
+        torch.nn.functional.dropout, args=(node, 0.1, True)
+    )
+    result.meta["example_value"] = torch.randn(4, 6)
+
+
+_LAYOUT_GUARD_OUTPUT_CASES = {
+    "output": (_guard_case_output, True),
+    "merge_view": (_guard_case_merge_view, True),
+    "merge_view_2d": (_guard_case_merge_view_2d, True),
+    "transpose_output": (_guard_case_transpose_output, True),
+    "no_metadata_alias": (_guard_case_no_metadata_alias, True),
+}
+
+_LAYOUT_GUARD_MUTATION_CASES = {
+    "mutable": (_guard_case_mutable, True),
+    "split_view_mutation": (_guard_case_split_view_mutation, True),
+    "view_setitem": (_guard_case_view_setitem, True),
+    "contiguous_mutation": (_guard_case_contiguous_mutation, True),
+    "inplace_relu": (_guard_case_inplace_relu, True),
+    "elu_inplace_pos": (_guard_case_elu_inplace_pos, True),
+    "out_user": (_guard_case_out_user, True),
+    "clone_out": (_guard_case_clone_out, True),
+    "to_copy_out": (_guard_case_to_copy_out, True),
+    "normalize_out": (_guard_case_normalize_out, True),
+}
+
+_LAYOUT_GUARD_COPY_CASES = {
+    "contiguous": (_guard_case_contiguous, False),
+    "conversion": (_guard_case_conversion, True),
+    "conversion_dtype_after_transpose": (
+        _guard_case_conversion_dtype_after_transpose,
+        False,
+    ),
+    "conversion_noop_after_transpose": (
+        _guard_case_conversion_noop_after_transpose,
+        True,
+    ),
+    "view_then_memory_format": (_guard_case_view_then_memory_format, True),
+    "elu_inplace_false": (_guard_case_elu_inplace_false, False),
+    "clone": (_guard_case_clone, False),
+}
+
+_LAYOUT_GUARD_RESOLUTION_CASES = {
+    "split_view": (_guard_case_split_view, False),
+    "view_with_one": (_guard_case_view_with_one, False),
+    "stride": (_guard_case_stride, True),
+    "transpose": (_guard_case_transpose, False),
+    "getitem": (_guard_case_getitem, False),
+    "split_call_function": (_guard_case_split_call_function, False),
+    "reshape_kwargs": (_guard_case_reshape_kwargs, False),
+    "log_softmax_stacklevel": (_guard_case_log_softmax_stacklevel, False),
+    "custom": (_guard_case_custom, True),
+    "higher_order": (_guard_case_higher_order, True),
+    "call_module": (_guard_case_call_module, True),
+    "dropout_eval_output": (_guard_case_dropout_eval_output, True),
+    "dropout_training": (_guard_case_dropout_training, False),
+}
+
+
+def _check_layout_guard_case(test_case, cases, case):
+    builder, expected = cases[case]
+    graph = torch.fx.Graph()
+    linear = graph.placeholder("linear")
+    linear.meta["example_value"] = torch.randn(4, 6)
+    builder(graph, linear)
+    test_case.assertEqual(_has_layout_sensitive_user(linear), expected)
 
 
 class _TestHighwaySelfGating(torch.nn.Module):
@@ -870,234 +1180,22 @@ class TestGroupBatchFusion(TestCase):
         self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
         self.assertEqual(subsets, [3])
 
-    @parametrize(
-        "case, expected_sensitive",
-        [
-            ("output", True),
-            ("merge_view", True),
-            ("merge_view_2d", True),
-            ("view_with_one", False),
-            ("split_view", False),
-            ("transpose", False),
-            ("getitem", False),
-            ("stride", True),
-            ("mutable", True),
-            ("conversion", True),
-            ("conversion_dtype_after_transpose", False),
-            ("conversion_noop_after_transpose", True),
-            ("split_view_mutation", True),
-            ("split_call_function", False),
-            ("contiguous", False),
-            ("contiguous_mutation", True),
-            ("out_user", True),
-            ("call_module", True),
-            ("custom", True),
-            ("higher_order", True),
-            ("dropout_eval_output", True),
-            ("inplace_relu", True),
-            ("view_setitem", True),
-            ("no_metadata_alias", True),
-            ("reshape_kwargs", False),
-            ("elu_inplace_false", False),
-            ("elu_inplace_pos", True),
-            ("log_softmax_stacklevel", False),
-            ("view_then_memory_format", True),
-            ("transpose_output", True),
-        ],
-    )
-    def test_batch_linear_lhs_direct_user_classification(
-        self, case, expected_sensitive
-    ):
-        from torch._higher_order_ops.triton_kernel_wrap import (
-            triton_kernel_wrapper_mutation,
-        )
-        from torch._inductor.fx_passes.group_batch_fusion import (
-            _has_layout_sensitive_user,
-        )
+    @parametrize("case", list(_LAYOUT_GUARD_OUTPUT_CASES))
+    def test_batch_linear_lhs_layout_guard_outputs(self, case):
+        _check_layout_guard_case(self, _LAYOUT_GUARD_OUTPUT_CASES, case)
 
-        def contiguous(graph, node):
-            result = graph.call_method("contiguous", args=(node,))
-            result.meta["example_value"] = node.meta["example_value"]
-            return result
+    @parametrize("case", list(_LAYOUT_GUARD_MUTATION_CASES))
+    def test_batch_linear_lhs_layout_guard_mutations(self, case):
+        _check_layout_guard_case(self, _LAYOUT_GUARD_MUTATION_CASES, case)
 
-        def view_setitem(graph, node):
-            view = split_view(graph, node)
-            return graph.call_function(operator.setitem, args=(view, 0, 0))
+    @parametrize("case", list(_LAYOUT_GUARD_COPY_CASES))
+    def test_batch_linear_lhs_layout_guard_copies(self, case):
+        _check_layout_guard_case(self, _LAYOUT_GUARD_COPY_CASES, case)
 
-        def transpose(graph, node):
-            result = graph.call_method("transpose", args=(node, 0, 1))
-            result.meta["example_value"] = node.meta["example_value"].transpose(0, 1)
-            return result
+    @parametrize("case", list(_LAYOUT_GUARD_RESOLUTION_CASES))
+    def test_batch_linear_lhs_layout_guard_resolution(self, case):
+        _check_layout_guard_case(self, _LAYOUT_GUARD_RESOLUTION_CASES, case)
 
-        def conversion(graph, node, copy_result, transpose_source=True):
-            source = transpose(graph, node) if transpose_source else node
-            if copy_result:
-                result = graph.call_method("to", args=(source, torch.float64))
-                result.meta["example_value"] = source.meta["example_value"].to(
-                    torch.float64
-                )
-            else:
-                result = graph.call_method("float", args=(source,))
-                result.meta["example_value"] = source.meta["example_value"]
-            return result
-
-        def merge_view(graph, node):
-            result = graph.call_method("view", args=(node, -1))
-            result.meta["example_value"] = node.meta["example_value"].view(-1)
-            return result
-
-        def sin_of(graph, result):
-            out = graph.call_function(torch.sin, args=(result,))
-            out.meta["example_value"] = torch.sin(result.meta["example_value"])
-            return out
-
-        def split_view(graph, node):
-            result = graph.call_method("view", args=(node, 2, 2, 6))
-            result.meta["example_value"] = node.meta["example_value"].view(2, 2, 6)
-            return result
-
-        def reshape_kwargs(graph, node):
-            result = graph.call_function(
-                torch.reshape,
-                kwargs={"input": node, "shape": (2, 2, 6)},
-            )
-            result.meta["example_value"] = node.meta["example_value"].reshape(2, 2, 6)
-            return sin_of(graph, result)
-
-        def split_view_terminal(graph, node):
-            return sin_of(graph, split_view(graph, node))
-
-        def getitem_terminal(graph, node):
-            item = graph.call_function(operator.getitem, args=(node, 0))
-            item.meta["example_value"] = node.meta["example_value"][0]
-            return sin_of(graph, item)
-
-        def transpose_output(graph, node):
-            return graph.output(transpose(graph, node))
-
-        def split_view_mutation(graph, node):
-            view = split_view(graph, node)
-            return graph.call_method("mul_", args=(view, 2))
-
-        def merge_view_2d(graph, node):
-            result = graph.call_method("view", args=(node, 2, 12))
-            result.meta["example_value"] = node.meta["example_value"].view(2, 12)
-            return result
-
-        def view_with_one(graph, node):
-            result = graph.call_method("view", args=(node, 4, 1, 6))
-            result.meta["example_value"] = node.meta["example_value"].view(4, 1, 6)
-            return sin_of(graph, result)
-
-        # Smoke test for positional _stacklevel binding; binding alone does not
-        # change the layout classification.
-        def log_softmax_stacklevel(graph, node):
-            result = graph.call_function(
-                torch.nn.functional.log_softmax, args=(node, 1, 3)
-            )
-            result.meta["example_value"] = torch.nn.functional.log_softmax(
-                node.meta["example_value"], 1
-            )
-            return result
-
-        def split_call_function(graph, node):
-            parts = graph.call_function(torch.split, args=(node, [3, 3], 1))
-            parts.meta["example_value"] = torch.split(
-                node.meta["example_value"], [3, 3], 1
-            )
-            item = graph.call_function(operator.getitem, args=(parts, 0))
-            item.meta["example_value"] = parts.meta["example_value"][0]
-            return sin_of(graph, item)
-
-        def view_then_memory_format(graph, node):
-            view = split_view(graph, node)
-            result = graph.call_method(
-                "to", args=(view,), kwargs={"memory_format": torch.contiguous_format}
-            )
-            result.meta["example_value"] = view.meta["example_value"]
-            return result
-
-        def out_user(graph, node):
-            out = graph.placeholder("out")
-            out.meta["example_value"] = torch.empty(4, 6)
-            return graph.call_function(
-                torch.ops.aten.sin.out, args=(node,), kwargs={"out": out}
-            )
-
-        def dropout(graph, node, training, p=0.1):
-            result = graph.call_function(
-                torch.nn.functional.dropout, args=(node, p, training)
-            )
-            if training and p != 0.0:
-                result.meta["example_value"] = torch.randn(4, 6)
-            else:
-                result.meta["example_value"] = node.meta["example_value"]
-            return result
-
-        builders = {
-            "output": lambda graph, node: graph.output(node),
-            "merge_view": merge_view,
-            "split_view": split_view_terminal,
-            "transpose": lambda graph, node: sin_of(graph, transpose(graph, node)),
-            "getitem": getitem_terminal,
-            "stride": lambda graph, node: graph.call_function(
-                torch.ops.aten.sym_stride.int, args=(node, 0)
-            ),
-            "mutable": lambda graph, node: graph.call_function(
-                torch.ops.aten.add_.Tensor, args=(node, 1)
-            ),
-            "conversion": lambda graph, node: graph.call_method(
-                "mul_", args=(conversion(graph, node, False, False), 2)
-            ),
-            "conversion_dtype_after_transpose": lambda graph, node: conversion(
-                graph, node, True, True
-            ),
-            "conversion_noop_after_transpose": lambda graph, node: graph.call_method(
-                "mul_", args=(conversion(graph, node, False, True), 2)
-            ),
-            "reshape_kwargs": reshape_kwargs,
-            "split_view_mutation": split_view_mutation,
-            "merge_view_2d": merge_view_2d,
-            "view_with_one": view_with_one,
-            "split_call_function": split_call_function,
-            "view_setitem": view_setitem,
-            "call_module": lambda graph, node: graph.call_module("m", args=(node,)),
-            "view_then_memory_format": view_then_memory_format,
-            "elu_inplace_false": lambda graph, node: graph.call_function(
-                torch.nn.functional.elu, args=(node, 1.0, False)
-            ),
-            "elu_inplace_pos": lambda graph, node: graph.call_function(
-                torch.nn.functional.elu, args=(node, 1.0, True)
-            ),
-            "log_softmax_stacklevel": log_softmax_stacklevel,
-            "no_metadata_alias": lambda graph, node: graph.output(
-                graph.call_method("float", args=(node,))
-            ),
-            "out_user": out_user,
-            "dropout_eval_output": lambda graph, node: graph.output(
-                dropout(graph, node, False)
-            ),
-            "inplace_relu": lambda graph, node: graph.call_function(
-                torch.nn.functional.relu, args=(node,), kwargs={"inplace": True}
-            ),
-            "custom": lambda graph, node: graph.call_function(
-                torch.ops._batch_linear_lhs_test.require_contiguous.default,
-                args=(node,),
-            ),
-            "higher_order": lambda graph, node: graph.call_function(
-                triton_kernel_wrapper_mutation, kwargs={"kwargs": {"input": node}}
-            ),
-            "contiguous": contiguous,
-            "transpose_output": transpose_output,
-            "contiguous_mutation": lambda graph, node: graph.call_method(
-                "mul_", args=(contiguous(graph, node), 2)
-            ),
-        }
-        graph = torch.fx.Graph()
-        linear = graph.placeholder("linear")
-        linear.meta["example_value"] = torch.randn(4, 6)
-        builders[case](graph, linear)
-        self.assertEqual(_has_layout_sensitive_user(linear), expected_sensitive)
 
     @parametrize(
         "op",
@@ -1192,6 +1290,7 @@ class TestGroupBatchFusion(TestCase):
             "contiguous_to",
             "transpose_contiguous",
             "slice_t_clone",
+            "zero_pad",
         ],
     )
     @parametrize("m", [1, 32])
@@ -1220,6 +1319,8 @@ class TestGroupBatchFusion(TestCase):
                     large = large.contiguous().to(torch.float64)
                 elif consumer == "transpose_contiguous":
                     large = large.t().contiguous()
+                elif consumer == "zero_pad":
+                    large = torch.nn.functional.pad(large, (0, 0))
                 else:
                     large = large[:1].t().clone()
                 return (
