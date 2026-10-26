@@ -50,6 +50,16 @@ def _(x: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(x)
 
 
+@torch.library.custom_op("_batch_linear_lhs_test::identity", mutates_args=())
+def _identity(x: torch.Tensor) -> torch.Tensor:
+    return x.clone()
+
+
+@_identity.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 @contextlib.contextmanager
 def _record_fusion_subsets():
     from unittest import mock
@@ -296,9 +306,7 @@ def _guard_case_reshape_kwargs(graph, node):
 
 
 def _guard_case_log_softmax_stacklevel(graph, node):
-    result = graph.call_function(
-        torch.nn.functional.log_softmax, args=(node, 1, 3)
-    )
+    result = graph.call_function(torch.nn.functional.log_softmax, args=(node, 1, 3))
     result.meta["example_value"] = torch.nn.functional.log_softmax(
         node.meta["example_value"], 1
     )
@@ -325,17 +333,13 @@ def _guard_case_call_module(graph, node):
 
 
 def _guard_case_dropout_eval_output(graph, node):
-    result = graph.call_function(
-        torch.nn.functional.dropout, args=(node, 0.1, False)
-    )
+    result = graph.call_function(torch.nn.functional.dropout, args=(node, 0.1, False))
     result.meta["example_value"] = node.meta["example_value"]
     graph.output(result)
 
 
 def _guard_case_dropout_training(graph, node):
-    result = graph.call_function(
-        torch.nn.functional.dropout, args=(node, 0.1, True)
-    )
+    result = graph.call_function(torch.nn.functional.dropout, args=(node, 0.1, True))
     result.meta["example_value"] = torch.randn(4, 6)
 
 
@@ -1051,12 +1055,7 @@ class TestGroupBatchFusion(TestCase):
         module = M().eval()
         _check_lhs_fusion(self, module, [2], torch.randn(4, 8))
 
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_zero_width_preserves_output(self):
         class M(torch.nn.Module):
             def __init__(self):
@@ -1085,23 +1084,9 @@ class TestGroupBatchFusion(TestCase):
                 )
                 return *valid, *empty
 
-        module = M().eval()
-        x = torch.randn(4, 8)
-        counters.clear()
-        with torch.no_grad():
-            expected = module(x)
-            with _record_fusion_subsets() as subsets:
-                actual = torch.compile(module, fullgraph=True)(x)
-        self.assertEqual(actual, expected)
-        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
-        self.assertEqual(subsets, [2])
+        _check_lhs_fusion(self, M().eval(), [2], torch.randn(4, 8), check_strides=True)
 
-    @torch._inductor.config.patch(
-        pre_grad_fusion_options={
-            "batch_linear_lhs": {"devices": ("cpu",), "min_fuse_set_size": 2},
-        },
-        post_grad_fusion_options={},
-    )
+    @_lhs_fusion_config
     def test_batch_linear_lhs_different_width_pointwise_consumers_fuse(self):
         class M(torch.nn.Module):
             def __init__(self):
@@ -1112,17 +1097,7 @@ class TestGroupBatchFusion(TestCase):
             def forward(self, x):
                 return torch.sin(self.proj_large(x)), torch.cos(self.proj_small(x))
 
-        counters.clear()
-        module = M().eval()
-        x = torch.randn(32, 64)
-        with torch.no_grad():
-            expected = module(x)
-            with _record_fusion_subsets() as subsets:
-                actual = torch.compile(module, fullgraph=True)(x)
-
-        self.assertEqual(actual, expected)
-        self.assertEqual(counters["inductor"]["batch_linear_lhs"], 1)
-        self.assertEqual(subsets, [2])
+        _check_lhs_fusion(self, M().eval(), [2], torch.randn(32, 64))
 
     @_lhs_fusion_config
     def test_batch_linear_lhs_symbolic_projection_width_fuses(self):
@@ -1195,7 +1170,6 @@ class TestGroupBatchFusion(TestCase):
     @parametrize("case", list(_LAYOUT_GUARD_RESOLUTION_CASES))
     def test_batch_linear_lhs_layout_guard_resolution(self, case):
         _check_layout_guard_case(self, _LAYOUT_GUARD_RESOLUTION_CASES, case)
-
 
     @parametrize(
         "op",
@@ -1371,6 +1345,31 @@ class TestGroupBatchFusion(TestCase):
 
         module = M().eval()
         _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
+
+    @parametrize(
+        "consumer",
+        ["merge_view_output", "dropout_eval_output", "custom_after_transpose"],
+    )
+    @_lhs_fusion_config
+    def test_batch_linear_lhs_skips_layout_paths_with_dynamo(self, consumer):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.large = torch.nn.Linear(64, 48, bias=False)
+                self.a = torch.nn.Linear(64, 16, bias=False)
+                self.b = torch.nn.Linear(64, 16, bias=False)
+
+            def forward(self, x):
+                large = self.large(x)
+                if consumer == "merge_view_output":
+                    large = large.view(-1)
+                elif consumer == "dropout_eval_output":
+                    large = torch.nn.functional.dropout(large, 0.1, False)
+                else:
+                    large = _identity(large.t())
+                return large, torch.sin(self.a(x)), torch.cos(self.b(x))
+
+        _check_lhs_fusion(self, M().eval(), [2], torch.randn(32, 64))
 
     @_lhs_fusion_config
     def test_batch_linear_lhs_keeps_dynamic_neg_one_view(self):
