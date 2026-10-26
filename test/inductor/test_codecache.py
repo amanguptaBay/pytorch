@@ -11,6 +11,7 @@ import pickle
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import textwrap
 import threading
@@ -580,6 +581,138 @@ def _custom_empty(*args: object, **kwargs: object) -> None:
 
 # Verify factory detection does not match arbitrary functions named like torch.empty.
 _custom_empty.__name__ = "empty"
+
+
+class TestCppPortableKey(TestCase):
+    """Precompile freezes C++ kernels under a key that survives relocation."""
+
+    def _key(self, *parts, roots=("/opt/t",), ext_suffix=".so"):
+        from torch._inductor import codecache
+
+        real_config_var = sysconfig.get_config_var
+        with (
+            mock.patch.object(codecache, "_relocatable_roots", return_value=roots),
+            mock.patch.object(
+                sysconfig,
+                "get_config_var",
+                side_effect=lambda name: ext_suffix
+                if name == "EXT_SUFFIX"
+                else real_config_var(name),
+            ),
+        ):
+            return codecache._portable_cpp_key(*parts)
+
+    def _real_command_line(self):
+        from torch._inductor.cpp_builder import CppBuilder, CppTorchDeviceOptions
+
+        return CppBuilder(
+            name="o",
+            sources="i",
+            BuildOption=CppTorchDeviceOptions(device_type="cpu"),
+        ).get_command_line()
+
+    def test_key_survives_relocating_the_install(self):
+        command = self._real_command_line()
+        root = normalize_path_separator(
+            os.path.dirname(os.path.dirname(torch.__file__))
+        )
+        self.assertIn(root, command)
+        moved = "/relocated/install"
+        self.assertEqual(
+            self._key("src", command, roots=(root,)),
+            self._key("src", command.replace(root, moved), roots=(moved,)),
+        )
+
+    def test_real_command_line_keeps_no_install_root(self):
+        from torch._inductor import codecache
+
+        stripped = codecache._strip_relocatable_roots(self._real_command_line())
+        pattern = codecache._root_pattern(codecache._relocatable_roots())
+        self.assertIsNone(pattern.search(stripped))
+
+    def test_key_tracks_paths_outside_install(self):
+        self.assertNotEqual(self._key("g++ -I/usr/a"), self._key("g++ -I/usr/b"))
+        # A sibling that merely shares the root's prefix is outside the install.
+        self.assertNotEqual(
+            self._key("-I/opt/t-cuda/include"), self._key("-I/opt/u-cuda/include")
+        )
+
+    def test_key_strips_only_whole_roots(self):
+        # A root in the middle of another path is not that root.
+        self.assertNotEqual(
+            self._key("-I/data/usr/include", roots=("/usr",)),
+            self._key("-I/data/opt/py/include", roots=("/opt/py",)),
+        )
+        # Every form a build command puts a root in is stripped.
+        forms = (
+            "-Wl,-rpath,{}:/other/lib",
+            "{},-flag",
+            "-I{} -L{}/lib",
+            "-I'{}/include dir'",
+            '/I "{}" /LIBPATH:"{}/libs"',
+            "-Wl,-rpath,{}/lib",
+            "--sysroot={}",
+        )
+        for form in forms:
+            self.assertEqual(
+                self._key(form.format("/opt/a", "/opt/a"), roots=("/opt/a",)),
+                self._key(form.format("/srv/b", "/srv/b"), roots=("/srv/b",)),
+                form,
+            )
+
+    def test_key_is_computed_only_for_precompile(self):
+        from torch._inductor import codecache
+        from torch.compiler import _runtime_cache
+
+        source = 'extern "C" long portable_key_probe(long x) { return x; }'
+        with (
+            fresh_cache(),
+            mock.patch.object(codecache.CppCodeCache, "_portable_keys", {}),
+            mock.patch.object(
+                codecache, "_portable_cpp_key", wraps=codecache._portable_cpp_key
+            ) as portable,
+        ):
+            lib = codecache.CppCodeCache.load(source)
+            portable.assert_not_called()
+            # A hit inside a capture still records the kernel under its key.
+            with _runtime_cache.capture_scope():
+                codecache.CppCodeCache.load(source)
+            portable.assert_called_once()
+            self.assertIn(lib.key, codecache.CppCodeCache._portable_keys)
+
+    def test_key_tracks_torch_source_and_python_abi(self):
+        from torch._inductor import codecache
+
+        base = self._key("src", "cmd")
+        self.assertNotEqual(base, self._key("other src", "cmd"))
+        self.assertNotEqual(base, self._key("src", "cmd", ext_suffix=".abi3.so"))
+        with mock.patch.object(codecache, "torch_key", return_value=b"other torch"):
+            self.assertNotEqual(base, self._key("src", "cmd"))
+
+    def test_system_prefixes_are_not_relocatable_roots(self):
+        from torch._inductor import codecache
+
+        with (
+            mock.patch.object(sys, "prefix", "/usr"),
+            mock.patch.object(sys, "base_prefix", "/usr/local"),
+        ):
+            roots = codecache._relocatable_roots.__wrapped__()
+        self.assertFalse({"/", "/usr", "/usr/local"} & set(roots))
+
+    def test_relocatable_roots_are_absolute_and_longest_first(self):
+        from torch._inductor import codecache
+
+        roots = codecache._relocatable_roots()
+        self.assertIn(
+            normalize_path_separator(os.path.dirname(os.path.dirname(torch.__file__))),
+            roots,
+        )
+        self.assertEqual(list(roots), sorted(roots, key=len, reverse=True))
+        # A relative PYTHONHOME makes the prefixes relative; they are not roots.
+        with mock.patch.object(sys, "base_prefix", "lib/python3"):
+            roots = codecache._relocatable_roots.__wrapped__()
+        self.assertNotIn("lib/python3", roots)
+        self.assertTrue(all(os.path.isabs(root) for root in roots))
 
 
 class TestPyCodeCache(TestCase):

@@ -2387,13 +2387,15 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_c(m, x), m(x))  # JIT fallback runs and is correct
 
     def test_missing_calling_convention_metadata_rejected(self):
+        from torch._precompile import _CACHE_VERSION
+
         # Syntactically valid python_code that lacks a required metadata global is not a
         # precompile artifact; load() raises a clear PrecompileError naming the gap.
         buf = io.BytesIO()
         torch.save(
             {
                 "format": "torch.compiler.precompile",
-                "version": 1,
+                "version": _CACHE_VERSION,
                 "backend": "inductor",
                 "artifact": None,
             },
@@ -7911,6 +7913,8 @@ class TestPrecompileRuntimeCache(TestCase):
         import hashlib
 
         from torch._inductor.codecache import CppCodeCache
+        from torch._inductor.cpp_builder import normalize_path_separator
+        from torch._inductor.runtime.runtime_utils import cache_dir
         from torch._inductor.utils import fresh_cache
         from torch.compiler import _runtime_cache
 
@@ -7919,10 +7923,11 @@ class TestPrecompileRuntimeCache(TestCase):
         source = (
             f'extern "C" {export}long frozen_cpp_kernel(long x) {{ return x + 7; }}'
         )
-        with fresh_cache():
+        with fresh_cache(), _runtime_cache.capture_scope():
             lib = CppCodeCache.load(source)
             with open(lib._name, "rb") as binary:
-                payload = pickle.dumps({lib.key: binary.read()})
+                portable_key = CppCodeCache._portable_keys[lib.key]
+                payload = pickle.dumps({portable_key: binary.read()})
         artifact = _runtime_cache.InductorCppCacheArtifact(
             hashlib.sha256(payload).hexdigest(), payload
         )
@@ -7934,6 +7939,73 @@ class TestPrecompileRuntimeCache(TestCase):
                     kernel = loaded.frozen_cpp_kernel
                     kernel.restype = ctypes.c_long
                     self.assertEqual(kernel(ctypes.c_long(5)), 12)
+                    # The binary is served from its own directory, never from
+                    # the shared cache path this build would compile to.
+                    name = os.path.basename(loaded._name)
+                    copies = [
+                        normalize_path_separator(os.path.join(directory, name))
+                        for directory, _, files in os.walk(cache_dir())
+                        if name in files
+                    ]
+                    self.assertEqual(copies, [loaded._name])
+                    self.assertIn("precompile_cpp", loaded._name)
+
+    def test_frozen_cpp_kernel_serves_a_relocated_install(self):
+        import ctypes
+        import hashlib
+
+        from torch._inductor import codecache
+        from torch._inductor.codecache import CppCodeCache
+        from torch._inductor.cpp_builder import CppBuilder, normalize_path_separator
+        from torch._inductor.utils import fresh_cache
+        from torch.compiler import _runtime_cache
+
+        export = "__declspec(dllexport) " if IS_WINDOWS else ""
+        source = (
+            f'extern "C" {export}long relocated_cpp_kernel(long x) {{ return x + 9; }}'
+        )
+        with fresh_cache(), _runtime_cache.capture_scope():
+            lib = CppCodeCache.load(source)
+            with open(lib._name, "rb") as binary:
+                portable_key = CppCodeCache._portable_keys[lib.key]
+                payload = pickle.dumps({portable_key: binary.read()})
+        artifact = _runtime_cache.InductorCppCacheArtifact(
+            hashlib.sha256(payload).hexdigest(), payload
+        )
+        # The serving launch runs the same build extracted somewhere else, so
+        # every include and library path in its build command moved.
+        root = normalize_path_separator(
+            os.path.dirname(os.path.dirname(torch.__file__))
+        )
+        moved = normalize_path_separator(os.path.join(tempfile.gettempdir(), "moved"))
+        roots = tuple(
+            sorted(
+                (moved if r == root else r for r in codecache._relocatable_roots()),
+                key=len,
+                reverse=True,
+            )
+        )
+        command_line = CppBuilder.get_command_line
+        with (
+            mock.patch.object(_runtime_cache, "_frozen_cpp_kernels", {}),
+            mock.patch.object(
+                CppBuilder,
+                "get_command_line",
+                lambda builder: command_line(builder).replace(root, moved),
+            ),
+            mock.patch.object(codecache, "_relocatable_roots", return_value=roots),
+            fresh_cache(),
+            torch.compiler.precompile.no_compilation(),
+        ):
+            artifact.populate_cache()
+            loaded = CppCodeCache.load_async(
+                source, submit_fn=lambda fn: self.fail("compiled a frozen C++ kernel")
+            )()
+            self.assertNotEqual(loaded.key, lib.key)
+            self.assertEqual(CppCodeCache._portable_keys[loaded.key], portable_key)
+            kernel = loaded.relocated_cpp_kernel
+            kernel.restype = ctypes.c_long
+            self.assertEqual(kernel(ctypes.c_long(5)), 14)
 
     @unittest.skipUnless(HAS_TRITON, "requires Triton")
     def test_capture_freezes_cpp_kernel_binaries(self):
@@ -7966,7 +8038,10 @@ class TestPrecompileRuntimeCache(TestCase):
                 torch.load(cache, weights_only=True)["artifact"]
             )
             (frozen,) = artifacts["inductor_cpp"]
-            self.assertEqual(pickle.loads(frozen.content), {lib.key: binary})
+            self.assertEqual(
+                pickle.loads(frozen.content),
+                {CppCodeCache._portable_keys[lib.key]: binary},
+            )
 
     def test_cpp_kernel_is_recorded_on_every_load(self):
         from torch._inductor.codecache import CppCodeCache
@@ -7979,7 +8054,12 @@ class TestPrecompileRuntimeCache(TestCase):
             CppCodeCache.load_async(source)
             with _runtime_cache.capture_scope():
                 CppCodeCache.load_async(source)
-                [(key, (binary_path, _))] = _runtime_cache._capture.cpp_kernels.items()
+                [(portable_key, (binary_path, _))] = (
+                    _runtime_cache._capture.cpp_kernels.items()
+                )
+            [key] = [
+                k for k, v in CppCodeCache._portable_keys.items() if v == portable_key
+            ]
             self.assertEqual(CppCodeCache._binary_paths[key], binary_path)
 
     def test_capture_builds_unforced_cpp_loads_and_rejects_missing_binaries(self):
@@ -8078,6 +8158,26 @@ class TestPrecompileRuntimeCache(TestCase):
             artifact.populate_cache()
             with fresh_cache():
                 self.assertEqual(_runtime_cache._frozen_cpp_kernels, {})
+
+    def test_frozen_cpp_kernels_sharing_a_key_restore_to_their_own_paths(self):
+        from torch.compiler import _runtime_cache
+
+        # Builds that only the install path told apart share a portable key.
+        restored = []
+        with tempfile.TemporaryDirectory() as directory:
+            for binary in (b"first build", b"second build"):
+                with mock.patch.object(
+                    _runtime_cache, "_frozen_cpp_kernels", {"key": binary}
+                ):
+                    path = _runtime_cache.frozen_cpp_kernel_path(
+                        "key", directory, ".so"
+                    )
+                    _runtime_cache.restore_cpp_kernel("key", path)
+                with open(path, "rb") as f:
+                    restored.append((os.path.basename(path), f.read()))
+        self.assertNotEqual(restored[0][0], restored[1][0])
+        self.assertEqual([b for _, b in restored], [b"first build", b"second build"])
+        self.assertTrue(all(name.startswith("key-") for name, _ in restored))
 
     def test_restore_cpp_kernel_keeps_an_existing_binary(self):
         import hashlib

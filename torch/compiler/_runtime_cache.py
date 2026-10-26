@@ -47,8 +47,8 @@ if TYPE_CHECKING:
 _frozen_triton_kernels: dict[str, bytes] = {}
 _loaded_triton_kernels: dict[str, CachingAutotuner] = {}
 _frozen_triton_kernels_lock = threading.Lock()
-# Keyed like CppCodeCache: by source and full build command, which includes the
-# producer's absolute include and library paths.
+# Keyed by CppCodeCache's portable key: the source and build command with the
+# torch and Python install roots removed (see _portable_cpp_key).
 _frozen_cpp_kernels: dict[str, bytes] = {}
 _frozen_cpp_kernels_lock = threading.Lock()
 
@@ -257,9 +257,30 @@ def record_cpp_kernel(key: str, binary_path: str, load: Callable[[], object]) ->
         owner.cpp_kernels[key] = (binary_path, load)
 
 
+def is_capturing() -> bool:
+    return _active_capture() is not None
+
+
+def has_frozen_cpp_kernels() -> bool:
+    with _frozen_cpp_kernels_lock:
+        return bool(_frozen_cpp_kernels)
+
+
 def has_frozen_cpp_kernel(key: str) -> bool:
     with _frozen_cpp_kernels_lock:
         return key in _frozen_cpp_kernels
+
+
+def frozen_cpp_kernel_path(key: str, directory: str, suffix: str) -> str:
+    """Where a frozen binary is restored, named by its key and content.
+
+    Different builds can share a key, so a file already at this path is kept
+    only because it holds the same bytes.
+    """
+    with _frozen_cpp_kernels_lock:
+        payload = _frozen_cpp_kernels[key]
+    digest = hashlib.sha256(payload).hexdigest()[:16]
+    return os.path.join(directory, f"{key}-{digest}{suffix}")
 
 
 def restore_cpp_kernel(key: str, binary_path: str) -> None:
