@@ -47,8 +47,9 @@ if TYPE_CHECKING:
 _frozen_triton_kernels: dict[str, bytes] = {}
 _loaded_triton_kernels: dict[str, CachingAutotuner] = {}
 _frozen_triton_kernels_lock = threading.Lock()
-# Keyed like CppCodeCache: by source and full build command, which includes the
-# producer's absolute include and library paths.
+# Keyed by source and the build command with the torch trees relocated
+# (codecache._relocatable_command_line), unlike CppCodeCache, which keys by this
+# host's paths.
 _frozen_cpp_kernels: dict[str, bytes] = {}
 _frozen_cpp_kernels_lock = threading.Lock()
 
@@ -255,6 +256,20 @@ def record_cpp_kernel(key: str, binary_path: str, load: Callable[[], object]) ->
         if owner is None or owner.pid != os.getpid():
             return
         owner.cpp_kernels[key] = (binary_path, load)
+
+
+def relocatable_cpp_key(compute: Callable[[], str], *, loaded: bool) -> str | None:
+    """The key a C++ kernel's binary is frozen and found under, from ``compute``,
+    or None, without computing it, when nothing would use it: no capture is active,
+    and the process already ``loaded`` the kernel or no replay installed frozen C++
+    kernels."""
+    if _active_capture() is None:
+        if loaded:
+            return None
+        with _frozen_cpp_kernels_lock:
+            if not _frozen_cpp_kernels:
+                return None
+    return compute()
 
 
 def has_frozen_cpp_kernel(key: str) -> bool:
