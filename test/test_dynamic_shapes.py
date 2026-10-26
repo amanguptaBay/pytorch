@@ -496,12 +496,12 @@ class TestPySymInt(TestCase):
         else:
             result = expand_x + expand_x
 
-        gt_op, _bt, is_size_obv = shape_env.guards[-1]
+        gt_op = shape_env.guards[-1].expr
         self.assertTrue(isinstance(gt_op, sympy.core.relational.StrictGreaterThan))
         self.assertTrue(str(x.shape[0]), str(gt_op.args[0]))
         self.assertTrue(str(expand_x.shape[1]), str(x.shape[0]))
         self.assertTrue(str(expand_x.shape[1]), str(result.shape[0]))
-        self.assertFalse(is_size_obv)
+        self.assertEqual(len(shape_env.guards[-1]), 2)
 
     def test_floordiv_static(self):
         shape_env = ShapeEnv()
@@ -1923,22 +1923,6 @@ class f(torch.nn.Module):
         for Tensor in legacy_ctors:
             res = Tensor(sym_args)
             self.assertEqual(res, expected, exact_dtype=False)
-
-    def test_backed_size_oblivious_01_spec(self):
-        from torch.fx.experimental.symbolic_shapes import guard_size_oblivious
-
-        @torch.compile(dynamic=True, fullgraph=True)
-        def f(a, b):
-            if guard_size_oblivious(a.size(0) == 1):
-                return b * 10
-            else:
-                return b * 20
-
-        with torch.fx.experimental._config.patch(backed_size_oblivious=True):
-            # always go to the >= 2 branch.
-            self.assertEqual(
-                f(torch.tensor([1]), torch.tensor([1])), torch.tensor([20])
-            )
 
     @fresh_cache()
     def test_slice_backed_size_oblivious(self):
@@ -7670,32 +7654,6 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertEqual(
             len(local_env.foreign_unbacked_symbol_cache), cache_size_before
         )
-
-    def test_transfer_constrains_size_on_cache_hit(self):
-        """When is_size=True and the expression resolves to a single Symbol
-        from the cache (cached via a non-size path earlier),
-        _constrain_range_for_size is still applied; the symbol ends up in
-        size_like."""
-        foreign_env = ShapeEnv()
-        u0 = foreign_env.create_unbacked_symint()
-
-        local_env = ShapeEnv()
-        # First: transfer u0 via the raw SymInt path (is_size=False).
-        raw_symint = self._transfer_symint(
-            local_env, u0, source=self._make_source("raw")
-        )
-        raw = raw_symint.node.expr
-        self.assertNotIn(raw, local_env.size_like)
-
-        # Now: transfer the same u0 as a tensor size dim (is_size=True via
-        # transfer_symbols_from_foreign_shape_env's UNBACKED path).
-        new_sizes, _, _ = local_env.transfer_symbols_from_foreign_shape_env(
-            (u0,), (1,), 0, source=self._make_source("tensor")
-        )
-        # Same cached local symbol reused.
-        self.assertEqual(new_sizes[0].node.expr, raw)
-        # And now it carries the size lower-bound constraint.
-        self.assertIn(raw, local_env.size_like)
 
     def test_foreign_unbacked_transfer_preserves_derived_tensor_expr(self):
         """Derived tensor dims are minted as opaque symbols; raw SymInt with
